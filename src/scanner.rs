@@ -1,10 +1,17 @@
 use crate::config::Config;
 use crate::utils::{is_jar_file, is_class_file, calculate_file_hash};
+use blake3::Hasher as Blake3Hasher;
+use fftw::array::AlignedVec;
+use fftw::plan::*;
+use fftw::types::*;
 use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
+use nalgebra::DMatrix;
+use num_complex::Complex;
 use rayon::prelude::*;
 use regex::Regex;
+use sha3::{Sha3_256, Digest};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -19,9 +26,14 @@ pub struct ScanResult {
     pub reason: Option<String>,
     pub severity: Option<Severity>,
     pub file_hash: String,
+    pub sha3_hash: String,
+    pub blake3_hash: String,
+    pub entropy: f64,
+    pub fourier_coefficient: Complex<f64>,
+    pub markov_probability: f64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 pub enum Severity {
     Low,
     Medium,
@@ -133,13 +145,7 @@ fn scan_jar(path: &Path, custom_patterns: &[Regex]) -> Option<ScanResult> {
             }
 
             if let Some((vulnerable, reason, severity)) = is_vulnerable(&contents, custom_patterns) {
-                return Some(ScanResult {
-                    file_path: path.to_string_lossy().to_string(),
-                    vulnerable,
-                    reason: Some(format!("{} in {}", reason, file.name())),
-                    severity: Some(severity),
-                    file_hash: calculate_file_hash(path),
-                });
+                return Some(create_scan_result(path, &contents, vulnerable, Some(reason), Some(severity)));
             }
         }
     }
@@ -166,13 +172,7 @@ fn scan_class(path: &Path, custom_patterns: &[Regex]) -> Option<ScanResult> {
     }
 
     if let Some((vulnerable, reason, severity)) = is_vulnerable(&contents, custom_patterns) {
-        Some(ScanResult {
-            file_path: path.to_string_lossy().to_string(),
-            vulnerable,
-            reason: Some(reason),
-            severity: Some(severity),
-            file_hash: calculate_file_hash(path),
-        })
+        Some(create_scan_result(path, &contents, vulnerable, Some(reason), Some(severity)))
     } else {
         None
     }
@@ -200,4 +200,90 @@ fn is_vulnerable(contents: &[u8], custom_patterns: &[Regex]) -> Option<(bool, St
     }
 
     None
+}
+
+fn create_scan_result(path: &Path, contents: &[u8], vulnerable: bool, reason: Option<String>, severity: Option<Severity>) -> ScanResult {
+    ScanResult {
+        file_path: path.to_string_lossy().to_string(),
+        vulnerable,
+        reason,
+        severity,
+        file_hash: calculate_file_hash(path),
+        sha3_hash: calculate_sha3_hash(contents),
+        blake3_hash: calculate_blake3_hash(contents),
+        entropy: calculate_entropy(contents),
+        fourier_coefficient: calculate_fourier_coefficient(contents),
+        markov_probability: calculate_markov_probability(contents),
+    }
+}
+
+fn calculate_sha3_hash(contents: &[u8]) -> String {
+    let mut hasher = Sha3_256::new();
+    hasher.update(contents);
+    format!("{:x}", hasher.finalize())
+}
+
+fn calculate_blake3_hash(contents: &[u8]) -> String {
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(contents);
+    format!("{}", hasher.finalize().to_hex())
+}
+
+fn calculate_entropy(contents: &[u8]) -> f64 {
+    let mut byte_counts = [0u32; 256];
+    for &byte in contents {
+        byte_counts[byte as usize] += 1;
+    }
+
+    let total_bytes = contents.len() as f64;
+    byte_counts.iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let prob = count as f64 / total_bytes;
+            -prob * prob.log2()
+        })
+        .sum()
+}
+
+fn calculate_fourier_coefficient(contents: &[u8]) -> Complex<f64> {
+    let n = contents.len();
+    let mut input: AlignedVec<c64> = contents.iter()
+        .map(|&x| c64::new(x as f64, 0.0))
+        .collect();
+
+    let mut output = AlignedVec::new(n);
+    let plan = C2CPlan64::aligned(&[n], Sign::Forward, Flag::MEASURE).unwrap();
+    plan.c2c(&mut input, &mut output).unwrap();
+
+    // Return the first non-DC coefficient
+    output.get(1).map(|&x| Complex::new(x.re, x.im)).unwrap_or(Complex::new(0.0, 0.0))
+}
+
+fn calculate_markov_probability(contents: &[u8]) -> f64 {
+    let transition_matrix = calculate_transition_matrix(contents);
+    let initial_state = contents[0] as usize;
+    
+    contents.windows(2)
+        .map(|window| transition_matrix[(window[0] as usize, window[1] as usize)])
+        .fold(1.0, |acc, prob| acc * prob)
+}
+
+fn calculate_transition_matrix(contents: &[u8]) -> DMatrix<f64> {
+    let mut counts = DMatrix::zeros(256, 256);
+    
+    for window in contents.windows(2) {
+        let (from, to) = (window[0] as usize, window[1] as usize);
+        counts[(from, to)] += 1.0;
+    }
+
+    for row in 0..256 {
+        let row_sum: f64 = counts.row(row).sum();
+        if row_sum > 0.0 {
+            for col in 0..256 {
+                counts[(row, col)] /= row_sum;
+            }
+        }
+    }
+
+    counts
 }

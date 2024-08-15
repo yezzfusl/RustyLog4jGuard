@@ -3,11 +3,23 @@ Effortless Log4j vulnerability detection.
 
 ## Features
 
-- Scans directories recursively for JAR and class files
-- Identifies potential Log4Shell vulnerabilities
-- Supports multi-threaded scanning for improved performance
-- Provides both text and JSON output formats
-- Includes a progress bar for real-time scanning feedback
+- Recursive scanning of directories for JAR and class files
+- Multi-threaded parallel scanning for improved performance
+- Identification of potential Log4Shell vulnerabilities
+- Support for custom vulnerability patterns using regex
+- File and directory exclusion patterns using glob syntax
+- Multiple hashing algorithms for file integrity checks:
+  - SHA-256
+  - SHA-3
+  - Blake3
+- Advanced analysis techniques:
+  - Entropy analysis for detecting obfuscated malicious code
+  - Fourier transform analysis for identifying hidden patterns
+  - Markov chain analysis for behavioral detection
+- Configurable output formats (text and JSON)
+- Progress bar for real-time scanning feedback
+- Quiet mode for CI/CD integration
+- Option to save results to a file
 
 ## Prerequisites
 
@@ -39,8 +51,13 @@ Run the scanner with the following command:
 - `--path <PATH>`: Specify the directory to scan (required)
 - `--format <FORMAT>`: Choose the output format (text or json) [default: text]
 - `--threads <THREADS>`: Set the number of threads to use for scanning (optional)
+- `--exclude <PATTERN>`: Exclude files/directories matching the given glob pattern (can be used multiple times)
+- `--custom-patterns <REGEX>`: Add custom vulnerability patterns as regex (can be used multiple times)
+- `--quiet`: Enable quiet mode (only output vulnerable files)
+- `--output <FILE>`: Save results to the specified file
 - `-h, --help`: Print help information
 - `-V, --version`: Print version information
+
 
 ### Examples:
 
