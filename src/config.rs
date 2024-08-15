@@ -1,3 +1,4 @@
+#[derive(Debug, Clone)]
 pub struct Config {
     pub path: String,
     pub format: String,

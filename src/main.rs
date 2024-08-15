@@ -5,7 +5,9 @@ mod utils;
 
 use clap::Parser;
 use config::Config;
-use log::info;
+use log::{error, info};
+use scanner::scan_directory;
+use std::process;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,6 +27,15 @@ fn main() {
     let config = Config::new(cli.path, cli.format);
 
     info!("Starting CVE-2021-44228 scanner");
-    // TODO: Implement scanning logic
-    info!("Scanning complete");
+    
+    match scan_directory(&config) {
+        Ok(results) => {
+            reporter::report_results(&results, &config.format);
+            info!("Scanning complete");
+        }
+        Err(e) => {
+            error!("Error during scanning: {}", e);
+            process::exit(1);
+        }
+    }
 }
