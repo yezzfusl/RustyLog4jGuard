@@ -1,11 +1,12 @@
 use crate::config::Config;
-use crate::utils::{is_jar_file, is_class_file};
+use crate::utils::{is_jar_file, is_class_file, calculate_file_hash};
+use glob::Pattern;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
 use rayon::prelude::*;
 use regex::Regex;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
 use walkdir::WalkDir;
@@ -16,51 +17,87 @@ pub struct ScanResult {
     pub file_path: String,
     pub vulnerable: bool,
     pub reason: Option<String>,
+    pub severity: Option<Severity>,
+    pub file_hash: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
 }
 
 pub fn scan_directory(config: &Config) -> Result<Vec<ScanResult>, Box<dyn std::error::Error>> {
-    info!("Scanning directory: {}", config.path);
+    if !config.quiet {
+        info!("Scanning directory: {}", config.path);
+    }
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.threads.unwrap_or_else(num_cpus::get))
         .build()?;
 
+    let exclude_patterns: Vec<Pattern> = config.exclude.iter()
+        .filter_map(|p| Pattern::new(p).ok())
+        .collect();
+
+    let custom_patterns: Vec<Regex> = config.custom_patterns.iter()
+        .filter_map(|p| Regex::new(p).ok())
+        .collect();
+
     let entries: Vec<_> = WalkDir::new(&config.path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+        .filter(|e| !is_excluded(e.path(), &exclude_patterns))
         .collect();
 
-    let progress_bar = Arc::new(ProgressBar::new(entries.len() as u64));
-    progress_bar.set_style(ProgressStyle::default_bar()
-        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
-        .unwrap()
-        .progress_chars("##-"));
+    let progress_bar = if !config.quiet {
+        Some(Arc::new(ProgressBar::new(entries.len() as u64)))
+    } else {
+        None
+    };
+
+    if let Some(pb) = &progress_bar {
+        pb.set_style(ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+            .unwrap()
+            .progress_chars("##-"));
+    }
 
     let results: Vec<ScanResult> = pool.install(|| {
         entries.par_iter()
             .filter_map(|entry| {
-                let pb = Arc::clone(&progress_bar);
+                let pb = progress_bar.as_ref().map(Arc::clone);
                 let path = entry.path();
                 let result = if is_jar_file(path) {
-                    scan_jar(path)
+                    scan_jar(path, &custom_patterns)
                 } else if is_class_file(path) {
-                    scan_class(path)
+                    scan_class(path, &custom_patterns)
                 } else {
                     None
                 };
-                pb.inc(1);
+                if let Some(pb) = pb {
+                    pb.inc(1);
+                }
                 result
             })
             .collect()
     });
 
-    progress_bar.finish_with_message("Scan complete");
+    if let Some(pb) = progress_bar {
+        pb.finish_with_message("Scan complete");
+    }
 
     Ok(results)
 }
 
-fn scan_jar(path: &Path) -> Option<ScanResult> {
+fn is_excluded(path: &Path, patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|pattern| pattern.matches_path(path))
+}
+
+fn scan_jar(path: &Path, custom_patterns: &[Regex]) -> Option<ScanResult> {
     debug!("Scanning JAR file: {:?}", path);
 
     let file = match File::open(path) {
@@ -95,11 +132,13 @@ fn scan_jar(path: &Path) -> Option<ScanResult> {
                 continue;
             }
 
-            if is_vulnerable(&contents) {
+            if let Some((vulnerable, reason, severity)) = is_vulnerable(&contents, custom_patterns) {
                 return Some(ScanResult {
                     file_path: path.to_string_lossy().to_string(),
-                    vulnerable: true,
-                    reason: Some(format!("Vulnerable class found: {}", file.name())),
+                    vulnerable,
+                    reason: Some(format!("{} in {}", reason, file.name())),
+                    severity: Some(severity),
+                    file_hash: calculate_file_hash(path),
                 });
             }
         }
@@ -108,7 +147,7 @@ fn scan_jar(path: &Path) -> Option<ScanResult> {
     None
 }
 
-fn scan_class(path: &Path) -> Option<ScanResult> {
+fn scan_class(path: &Path, custom_patterns: &[Regex]) -> Option<ScanResult> {
     debug!("Scanning class file: {:?}", path);
 
     let file = match File::open(path) {
@@ -126,27 +165,39 @@ fn scan_class(path: &Path) -> Option<ScanResult> {
         return None;
     }
 
-    if is_vulnerable(&contents) {
+    if let Some((vulnerable, reason, severity)) = is_vulnerable(&contents, custom_patterns) {
         Some(ScanResult {
             file_path: path.to_string_lossy().to_string(),
-            vulnerable: true,
-            reason: Some("Vulnerable code pattern found".to_string()),
+            vulnerable,
+            reason: Some(reason),
+            severity: Some(severity),
+            file_hash: calculate_file_hash(path),
         })
     } else {
         None
     }
 }
 
-fn is_vulnerable(contents: &[u8]) -> bool {
+fn is_vulnerable(contents: &[u8], custom_patterns: &[Regex]) -> Option<(bool, String, Severity)> {
     let vulnerable_patterns = [
-        r"org/apache/logging/log4j/core/lookup/JndiLookup",
-        r"javax/naming/InitialContext",
-        r"javax/naming/Context",
-        r"\$\{jndi:",
+        (r"org/apache/logging/log4j/core/lookup/JndiLookup", Severity::Critical),
+        (r"javax/naming/InitialContext", Severity::High),
+        (r"javax/naming/Context", Severity::High),
+        (r"\$\{jndi:", Severity::Critical),
     ];
 
-    vulnerable_patterns.iter().any(|&pattern| {
+    for (pattern, severity) in vulnerable_patterns.iter() {
         let re = Regex::new(pattern).unwrap();
-        re.is_match(&String::from_utf8_lossy(contents))
-    })
+        if re.is_match(&String::from_utf8_lossy(contents)) {
+            return Some((true, format!("Vulnerable pattern found: {}", pattern), severity.clone()));
+        }
+    }
+
+    for pattern in custom_patterns {
+        if pattern.is_match(&String::from_utf8_lossy(contents)) {
+            return Some((true, format!("Custom vulnerability pattern found: {}", pattern), Severity::High));
+        }
+    }
+
+    None
 }
