@@ -19,19 +19,24 @@ struct Cli {
     /// Output format (json or text)
     #[arg(short, long, default_value = "text")]
     format: String,
+
+    /// Number of threads to use for scanning (default: number of logical CPUs)
+    #[arg(short, long)]
+    threads: Option<usize>,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = Cli::parse();
-    let config = Config::new(cli.path, cli.format);
+    let config = Config::new(cli.path, cli.format, cli.threads);
 
     info!("Starting CVE-2021-44228 scanner");
     
     match scan_directory(&config) {
         Ok(results) => {
-            reporter::report_results(&results, &config.format);
+            reporter::report_results(&results, &config.format)?;
             info!("Scanning complete");
+            Ok(())
         }
         Err(e) => {
             error!("Error during scanning: {}", e);
