@@ -1,0 +1,6 @@
+[package]
+name = "cve_2021_44228_scanner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
